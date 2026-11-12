@@ -28,8 +28,8 @@ backend/
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| POST | /api/auth/sms/send | 公开 | 发送登录验证码（短信兜底） |
-| POST | /api/auth/sms/verify | 公开 | 校验验证码并登录，返回 JWT |
+| POST | /api/auth/sms/send | 公开 | 发送登录验证码（`SMS_PROVIDER` 选通道；同号 60s 限一次） |
+| POST | /api/auth/sms/verify | 公开 | 校验验证码并登录，返回 JWT（PNVS 通道由阿里云核验） |
 | POST | /api/auth/oneclick | 公开 | 阿里云号码认证一键登录（预留位） |
 | POST | /api/devices/resolve | 公开 | 扫码后按 device_id 查设备与绑定状态 |
 | POST | /api/devices/bind | JWT | 绑定设备到当前用户 |
@@ -84,6 +84,26 @@ backend 与 gateway 对 Redis 键名、扣费口径必须完全一致（沿用�
 ## 短信 / 号码认证
 
 - 网页端个人开发者建议先用**短信验证码**兜底（`/api/auth/sms/send`），稳定不依赖机型网络。
+- **两条通道都已接入**，由 `SMS_PROVIDER` 单选（`src/lib.js` 的 `smsMode()`，RPC HMAC-SHA1 签名，纯 `node:crypto`）：
+
+  | `SMS_PROVIDER` | 阿里云产品 | 验证码由谁生成/核验 | 需要的配置 |
+  |---|---|---|---|
+  | `dypnsapi` | **号码认证服务·短信认证**（个人开发者可用，用控制台**赠送**的签名+模板，无需审核） | 阿里云生成、阿里云核验，**本地不写 `sms_code`** | `SendSmsVerifyCode` / `CheckSmsVerifyCode`，签名/模板用赠送值（模板 CODE 是纯数字，如 `100001`） |
+  | `dysmsapi` | 短信服务（需资质/签名/模板**审核通过**） | 我们自己生成、存 `sms_code`、自己比对 | `SendSms`，模板变量必须叫 `code`，例：`您的验证码为${code}，5 分钟内有效。` |
+  | 留空 | — | 自己生成，只落库不外发 | 仅 `SMS_DEBUG_RETURN_CODE=true` 时回传 `debugCode` 供联调 |
+
+  任一分支都要 `ALIYUN_ACCESS_KEY_ID` / `ALIYUN_ACCESS_KEY_SECRET` / `ALIYUN_SMS_SIGN_NAME` /
+  `ALIYUN_SMS_TEMPLATE_CODE` **四项全部非空**才会真实下发；否则退回调试/未配置状态，签名模板还在审时也不会卡住联调。
+- **PNVS 通道的模板占位符**：验证码位必须传字面量 `##code##`（阿里云据此生成），默认
+  `{"code":"##code##","min":"5"}`，可用 `ALIYUN_SMS_TEMPLATE_PARAM_JSON` 覆盖成与赠送模板一字不差的内容；
+  `ALIYUN_SMS_SCHEME_NAME` 留空即用默认方案，但发送与核验必须同值。
+- 三种行为：未配置 + 调试开 → `debugCode` 随响应返回；未配置 + 调试关 → `code:5012` 短信通道未配置；
+  配置齐 + 下发失败 → `code:5011` 带阿里云原始码（dysmsapi 会回滚验证码记录，PNVS 会释放频控锁，都不白扣次数）。
+- **频控**：同一手机号默认 60 秒内只允许一条，第二次返 `code:4290`。dysmsapi 基于 `sms_code.created_at`；
+  PNVS 因为不落库，改用 Redis `sms:cooldown:{phone}`（`SET … EX <Interval> NX`），阿里云侧 `Interval` 是第二道保险。
+- **PNVS 核验语义坑**：`CheckSmsVerifyCode` 返 `Code=OK` 只代表接口调通，**核验结果只看 `Model.VerifyResult === 'PASS'`**；
+  接口本身调不通（网络/鉴权）返 `code:5013`，绝不当成“验证码错误”回 4002。
+- 上线前还建议加滑块/验证码门禁，目前接口仅靠频控防刷。
 - 一键登录（`/api/auth/oneclick`）已留接口位：前端接阿里云号码认证 SDK，拿到 token 传后端，后端调 `GetMobile` 换真实手机号后复用同一套登录逻辑。H5 一键登录体验不稳，App 端才适合，本项目暂不做 App。
 - 开发调试时把 `SMS_DEBUG_RETURN_CODE=true`，验证码随 `/sms/send` 响应返回，方便联调；上线务必关掉。
 

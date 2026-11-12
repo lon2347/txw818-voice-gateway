@@ -1,4 +1,4 @@
-// 公共基础设施：配置、MySQL、Redis、JWT、统一响应、支付宝签名/验签
+// 公共基础设施：配置、MySQL、Redis、JWT、统一响应、支付宝签名/验签、阿里云短信 RPC 签名
 require('dotenv').config();
 const crypto = require('crypto');
 const mysql = require('mysql2/promise');
@@ -17,7 +17,42 @@ const cfg = {
     notifyUrl: process.env.ALIPAY_NOTIFY_URL || '',
     returnUrl: process.env.ALIPAY_RETURN_URL || '',
   },
+  // 阿里云短信。两条通道、同一套 RPC 签名（见下方 smsMode）：
+  //   SMS_PROVIDER=dypnsapi  号码认证服务·短信认证（验证码由阿里云生成+核验，个人开发者可用，用赠送签名+赠送模板）
+  //   SMS_PROVIDER=dysmsapi  短信服务（验证码自己生成、自己存 sms_code、自己比对）
+  //   留空                不发短信，仅 SMS_DEBUG_RETURN_CODE=true 时把验证码回传前端
+  aliyun: {
+    provider: (process.env.SMS_PROVIDER || '').trim().toLowerCase(),
+    accessKeyId: process.env.ALIYUN_ACCESS_KEY_ID || '',
+    accessKeySecret: process.env.ALIYUN_ACCESS_KEY_SECRET || '',
+    // dypnsapi：赠送签名/赠送模板 CODE（如 100001）；dysmsapi：审核通过的签名/模板（如 SMS_123456789）
+    signName: process.env.ALIYUN_SMS_SIGN_NAME || '',
+    templateCode: process.env.ALIYUN_SMS_TEMPLATE_CODE || '',
+    endpoint: process.env.ALIYUN_SMS_ENDPOINT || '',            // 留空按 provider 自动取域名
+    region: process.env.ALIYUN_SMS_REGION || 'cn-hangzhou',
+    schemeName: process.env.ALIYUN_SMS_SCHEME_NAME || '',       // 仅 dypnsapi：认证方案名称，留空为默认方案
+    templateParam: process.env.ALIYUN_SMS_TEMPLATE_PARAM_JSON || '', // 仅 dypnsapi：模板占位符 JSON
+    codeType: parseInt(process.env.ALIYUN_SMS_CODE_TYPE || '1', 10),      // 1=纯数字
+    codeLength: parseInt(process.env.ALIYUN_SMS_CODE_LENGTH || '6', 10),
+    validTime: parseInt(process.env.ALIYUN_SMS_VALID_TIME || '300', 10),
+    interval: parseInt(process.env.ALIYUN_SMS_INTERVAL || '60', 10),
+  },
 };
+
+function aliEndpoint() {
+  const a = cfg.aliyun;
+  if (a.endpoint) return a.endpoint;
+  return a.provider === 'dypnsapi' ? 'dypnsapi.aliyuncs.com' : 'dysmsapi.aliyuncs.com';
+}
+
+// 当前生效的短信通道：'dypnsapi' | 'dysmsapi' | 'off'（'off' = 不真发短信）
+function smsMode() {
+  const a = cfg.aliyun;
+  if (!(a.accessKeyId && a.accessKeySecret && a.signName && a.templateCode)) return 'off';
+  return (a.provider === 'dypnsapi' || a.provider === 'dysmsapi') ? a.provider : 'off';
+}
+
+function smsConfigured() { return smsMode() !== 'off'; }
 
 // ---------- MySQL ----------
 const pool = mysql.createPool({
@@ -85,6 +120,121 @@ async function syncBalanceToRedis(uid) {
   return sec;
 }
 
+// ---------- 阿里云 RPC 公共调用（签名：HMAC-SHA1，纯 node crypto，与支付宝 RSA2 同思路）----------
+// 阿里云 RPC 的百分号编码：RFC3986，保留 -_.~，其余一律 %XX（+ 必须编成 %20）
+function aliPercentEncode(v) {
+  return encodeURIComponent(String(v)).replace(/!/g, '%21').replace(/'/g, '%27')
+    .replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\*/g, '%2A');
+}
+
+function aliRpcSign(params, accessKeySecret) {
+  const canonical = Object.keys(params)
+    .filter(k => k !== 'Signature' && params[k] !== '' && params[k] != null)
+    .sort()
+    .map(k => aliPercentEncode(k) + '=' + aliPercentEncode(params[k]))
+    .join('&');
+  const stringToSign = 'POST&' + aliPercentEncode('/') + '&' + aliPercentEncode(canonical);
+  const sign = crypto.createHmac('sha1', accessKeySecret + '&').update(stringToSign, 'utf8').digest('base64');
+  return { sign, canonical };
+}
+
+// dysmsapi 与 dypnsapi 的 API 版本同为 2017-05-25，签名风格同为 RPC
+async function aliRpcCall(action, biz) {
+  const https = require('https');
+  const a = cfg.aliyun;
+  const params = Object.assign({
+    Action: action,
+    Version: '2017-05-25',
+    Format: 'JSON',
+    AccessKeyId: a.accessKeyId,
+    SignatureMethod: 'HMAC-SHA1',
+    SignatureVersion: '1.0',
+    SignatureNonce: crypto.randomUUID(),
+    Timestamp: new Date().toISOString().replace(/\.\d+Z$/, 'Z'), // UTC，形如 2026-11-12T02:11:04Z
+    RegionId: a.region,
+  }, biz);
+  const { sign } = aliRpcSign(params, a.accessKeySecret);
+  params.Signature = sign;
+  // 提交串也按 key 字典序拼，与待签串保持一致，便于排障时逐字比对
+  const body = Object.keys(params)
+    .filter(k => params[k] !== '' && params[k] != null)
+    .sort()
+    .map(k => aliPercentEncode(k) + '=' + aliPercentEncode(params[k]))
+    .join('&');
+
+  return new Promise((resolve) => {
+    const req = https.request({
+      host: aliEndpoint(), path: '/', method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 5000,
+    }, (res) => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => {
+        let j = {};
+        try { j = JSON.parse(raw); } catch (e) { /* 非 JSON 响应按未知码处理 */ }
+        // Code=OK 只代表阿里云受理了提交，终端送达是异步的；核验结果另看 Model.VerifyResult
+        resolve({ ok: j.Code === 'OK', code: j.Code || ('HTTP_' + res.statusCode), msg: j.Message || '', data: j });
+      });
+    });
+    req.on('timeout', () => { req.destroy(new Error('aliyun sms timeout')); });
+    req.on('error', (e) => resolve({ ok: false, code: 'NETWORK_ERROR', msg: e.message, data: {} }));
+    req.end(body);
+  });
+}
+
+// 通道一：短信服务 Dysmsapi。验证码由我们自己生成，TemplateParam 直接填具体值
+async function sendSms(phone, templateParam) {
+  const a = cfg.aliyun;
+  return aliRpcCall('SendSms', {
+    PhoneNumbers: phone,
+    SignName: a.signName,
+    TemplateCode: a.templateCode,
+    TemplateParam: templateParam ? JSON.stringify(templateParam) : undefined,
+  });
+}
+
+// 通道二：号码认证服务 PNVS。验证码位置传占位符 ##code##，由阿里云生成（占位符时 CodeType 必填），
+// 核验也只能走 CheckSmsVerifyCode——自己填具体验证码时阿里云无法核验。
+function pnvsTemplateParam() {
+  const a = cfg.aliyun;
+  if (a.templateParam) return a.templateParam; // 需与赠送模板的变量完全一致，多传/少传都会被判非法参数
+  return JSON.stringify({ code: '##code##', min: String(Math.max(1, Math.round(a.validTime / 60))) });
+}
+
+async function pnvsSendCode(phone, opts = {}) {
+  const a = cfg.aliyun;
+  const r = await aliRpcCall('SendSmsVerifyCode', {
+    PhoneNumber: phone,
+    CountryCode: '86',
+    SchemeName: a.schemeName || undefined,
+    SignName: a.signName,
+    TemplateCode: a.templateCode,
+    TemplateParam: pnvsTemplateParam(),
+    CodeType: a.codeType,
+    CodeLength: a.codeLength,
+    ValidTime: a.validTime,
+    Interval: a.interval,
+    DuplicatePolicy: 1,             // 同号重发时旧码失效
+    ReturnVerifyCode: opts.returnCode ? 'true' : undefined, // 仅调试用，将验证码回传便于联调
+  });
+  if (r.ok) r.verifyCode = (r.data.Model && r.data.Model.VerifyCode) || '';
+  return r;
+}
+
+// 核验：阿里云明确说明 Code=OK 不代表核验通过，只以 Model.VerifyResult === 'PASS' 为准
+async function pnvsCheckCode(phone, code) {
+  const a = cfg.aliyun;
+  const r = await aliRpcCall('CheckSmsVerifyCode', {
+    PhoneNumber: phone,
+    CountryCode: '86',
+    SchemeName: a.schemeName || undefined,
+    VerifyCode: code,
+  });
+  r.pass = r.ok && r.data.Model && r.data.Model.VerifyResult === 'PASS';
+  return r;
+}
+
 // ---------- 支付宝签名 / 验签（RSA2 / SHA256withRSA，纯 node crypto）----------
 function normalizePem(key, kind) {
   if (/BEGIN/.test(key)) return key;
@@ -119,4 +269,5 @@ module.exports = {
   cfg, pool, redis, ok, fail, signToken, auth,
   balanceKey, grantPaidOrder, syncBalanceToRedis,
   alipaySign, alipayVerifyNotify,
+  sendSms, pnvsSendCode, pnvsCheckCode, smsConfigured, smsMode,
 };
