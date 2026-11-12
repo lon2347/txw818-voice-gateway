@@ -1,0 +1,18 @@
+# 与 voice-gateway-deploy/docker-compose.yml 放在同一目录，docker compose 会自动合并。
+# 仅新增 backend 服务；网关保持原样。backend 不映射宿主机端口，只走内部网络由 Nginx 反代。
+services:
+  backend:
+    build: ./backend
+    image: voice-backend:latest
+    env_file: ./backend/.env
+    depends_on:
+      - mysql
+      - redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    # 与 nginx/mysql/redis 同一网络（沿用原 compose 的默认网络即可）
+    networks:
+      - default

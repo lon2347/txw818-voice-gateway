@@ -1,0 +1,28 @@
+# Node dependencies
+frontend/node_modules/
+backend/node_modules/
+gateway/node_modules/
+
+# Build output
+frontend/dist/
+frontend/.angular/
+
+# Environment secrets (keep .env.example)
+backend/.env
+gateway/.env
+
+# SSL private key (keep public cert)
+nginx/certs/privkey.pem
+nginx/certs/fullchain.pem
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
